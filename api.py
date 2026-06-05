@@ -3,15 +3,33 @@ import uuid
 from typing import List, Optional, Dict
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
+
+# ============================================================
+# STUB FUNCTIONS – required by autoshopify.py (original)
+# These replace the missing 'main' module imports.
+# ============================================================
+def autoshopify_add_user_site(*args, **kwargs): return True
+def autoshopify_add_user_sites_from_file(*args, **kwargs): return 0
+def autoshopify_get_user_sites(*args, **kwargs): return []
+def autoshopify_get_user_sites_count(*args, **kwargs): return 0
+def autoshopify_clear_user_sites(*args, **kwargs): return True
+def autoshopify_add_user_proxy(*args, **kwargs): return True
+def autoshopify_add_user_proxies_from_file(*args, **kwargs): return 0
+def autoshopify_get_user_proxies(*args, **kwargs): return []
+def autoshopify_get_user_proxies_count(*args, **kwargs): return 0
+def autoshopify_clear_user_proxies(*args, **kwargs): return True
+# ============================================================
+
+# Now import the unchanged AutoshopifyChecker
 from autoshopify import AutoShopifyChecker
 
 app = FastAPI(title="Shopify Checker API")
 checker = AutoShopifyChecker()
 
-# Concurrency limit – adjust based on your needs
+# Concurrency limit – adjust as needed
 SEMAPHORE = asyncio.Semaphore(10)
 
-# In‑memory storage for user sites/proxies (replace with DB later)
+# In‑memory storage for user sites/proxies (for the API endpoints)
 user_sites: Dict[int, List[str]] = {}
 user_proxies: Dict[int, List[str]] = {}
 
@@ -103,7 +121,7 @@ async def run_mass_check(task_id: str, cards: List[str], sites: List[str], proxi
 
     mass_tasks[task_id]["status"] = "completed"
 
-# ---------- User Site Management ----------
+# ---------- User Site Management (optional, for bot integration) ----------
 @app.post("/user/{user_id}/sites")
 async def add_user_site(user_id: int, site: str):
     if user_id not in user_sites:
