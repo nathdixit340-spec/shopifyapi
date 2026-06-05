@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+aiohttp
+aiohttp_socks
+nest_asyncio
+python-multipart
