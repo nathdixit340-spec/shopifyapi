@@ -1,0 +1,6 @@
+flask
+aiohttp
+aiohttp_socks
+nest_asyncio
+requests
+pyTelegramBotAPI
