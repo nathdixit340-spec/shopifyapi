@@ -7,13 +7,21 @@ from autoshopify import AutoShopifyChecker
 app = Flask(__name__)
 checker = AutoShopifyChecker()
 
-# Concurrency limit – how many cards to check at once
+# Concurrency limit
 MAX_CONCURRENT = 10
 
-# In-memory storage (replace with DB if needed)
+# In-memory storage (replace with database later)
 mass_tasks = {}
 user_sites = {}
 user_proxies = {}
+
+def normalize_site(site: str) -> str:
+    """Normalize site: lowercase, remove protocol, trailing slash"""
+    site = site.lower().strip()
+    for prefix in ['https://', 'http://']:
+        if site.startswith(prefix):
+            site = site[len(prefix):]
+    return site.rstrip('/')
 
 def run_async(coro):
     """Run an async function in a new event loop"""
@@ -24,7 +32,7 @@ def run_async(coro):
     finally:
         loop.close()
 
-# ------------------- Single Check -------------------
+# ---------- Single Check ----------
 @app.route('/check/single', methods=['POST'])
 def single_check():
     data = request.json
@@ -46,7 +54,7 @@ def single_check():
         'gateway': info.get('gateway')
     })
 
-# ------------------- Mass Check with Concurrency -------------------
+# ---------- Mass Check with Concurrency ----------
 @app.route('/check/mass', methods=['POST'])
 def mass_check():
     data = request.json
@@ -94,6 +102,7 @@ def mass_check():
                     'site': site
                 }
                 mass_tasks[task_id]['processed'] += 1
+                # Update results list (store non-None entries)
                 mass_tasks[task_id]['results'] = [r for r in results if r is not None]
 
         async def run_all():
@@ -115,12 +124,14 @@ def get_mass_status(task_id):
         return jsonify({'error': 'Task not found'}), 404
     return jsonify(mass_tasks[task_id])
 
-# ------------------- User Site/Proxy Management -------------------
+# ---------- User Site Management (Case‑Insensitive) ----------
 @app.route('/user/<int:user_id>/sites', methods=['POST'])
 def add_user_site(user_id):
     site = request.args.get('site') or request.json.get('site')
     if not site:
         return jsonify({'error': 'Missing site'}), 400
+    site = normalize_site(site)
+    
     if user_id not in user_sites:
         user_sites[user_id] = []
     if site not in user_sites[user_id]:
@@ -133,15 +144,21 @@ def get_user_sites(user_id):
 
 @app.route('/user/<int:user_id>/sites/<path:site>', methods=['DELETE'])
 def remove_user_site(user_id, site):
-    if user_id in user_sites and site in user_sites[user_id]:
-        user_sites[user_id].remove(site)
+    site = normalize_site(site)
+    if user_id in user_sites:
+        original = user_sites[user_id]
+        # Remove case‑insensitively
+        user_sites[user_id] = [s for s in original if s != site]
     return jsonify({'status': 'ok'})
 
+# ---------- User Proxy Management (Case‑Sensitive but trimmed) ----------
 @app.route('/user/<int:user_id>/proxies', methods=['POST'])
 def add_user_proxy(user_id):
     proxy = request.args.get('proxy') or request.json.get('proxy')
     if not proxy:
         return jsonify({'error': 'Missing proxy'}), 400
+    proxy = proxy.strip()
+    
     if user_id not in user_proxies:
         user_proxies[user_id] = []
     if proxy not in user_proxies[user_id]:
@@ -154,6 +171,7 @@ def get_user_proxies(user_id):
 
 @app.route('/user/<int:user_id>/proxies/<path:proxy>', methods=['DELETE'])
 def remove_user_proxy(user_id, proxy):
+    proxy = proxy.strip()
     if user_id in user_proxies and proxy in user_proxies[user_id]:
         user_proxies[user_id].remove(proxy)
     return jsonify({'status': 'ok'})
