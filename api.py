@@ -13,14 +13,13 @@ app = Flask(__name__)
 checker = AutoShopifyChecker()
 
 MAX_CONCURRENT = 5
-MAX_RETRIES = 3          # Retry failed cards up to 3 times
-RETRY_DELAY = 2          # Seconds between retries
+MAX_RETRIES = 3
+RETRY_DELAY = 2
 
 mass_tasks = {}
 user_sites = {}
 user_proxies = {}
 
-# Error patterns that trigger a retry on a different site
 RETRYABLE_ERRORS = [
     "Error parsing shipping response",
     "Site Error - Cannot access products",
@@ -66,7 +65,7 @@ def single_check():
         'gateway': info.get('gateway')
     })
 
-# ---------- Mass Check with Retry & Site Rotation ----------
+# ---------- Mass Check ----------
 @app.route('/check/mass', methods=['POST'])
 def mass_check():
     data = request.json
@@ -96,19 +95,14 @@ def mass_check():
                 return {'card': card_line, 'error': 'Invalid format'}
 
             cc, mm, yy, cvv = cc_parts
-            # Try with different sites from the list
             for attempt in range(MAX_RETRIES):
-                # Rotate site on each attempt (if more than one site available)
                 site = sites[(site_idx + attempt) % len(sites)] if attempt > 0 else initial_site
                 try:
                     success, response, info = await checker.check_card(site, cc, mm, yy, cvv, proxy)
-                    # Check if response contains retryable error
                     if any(err in response for err in RETRYABLE_ERRORS):
-                        logger.info(f"Retryable error on {site}: {response[:50]}. Attempt {attempt+1}/{MAX_RETRIES}")
                         if attempt < MAX_RETRIES - 1:
                             await asyncio.sleep(RETRY_DELAY)
                             continue
-                    # If success or non‑retryable, return result
                     return {
                         'card': card_line,
                         'success': success,
@@ -130,20 +124,17 @@ def mass_check():
                             'site': site,
                             'attempts': attempt + 1
                         }
-            # Fallback (should not reach here)
             return {'card': card_line, 'error': 'Max retries exceeded'}
 
         async def check_one(index, card_line):
             nonlocal site_idx, proxy_idx
             async with semaphore:
-                # Initial site from rotation
                 site = sites[site_idx % len(sites)]
                 site_idx += 1
                 proxy = None
                 if proxies:
                     proxy = proxies[proxy_idx % len(proxies)]
                     proxy_idx += 1
-
                 result = await check_with_retry(card_line, site, proxy)
                 results[index] = result
                 mass_tasks[task_id]['processed'] += 1
@@ -168,7 +159,52 @@ def get_mass_status(task_id):
         return jsonify({'error': 'Task not found'}), 404
     return jsonify(mass_tasks[task_id])
 
-# ---------- User Site Management (unchanged) ----------
+# ---------- Site Testing & Bulk Add ----------
+@app.route('/user/<int:user_id>/sites/test', methods=['POST'])
+def test_and_add_sites():
+    data = request.json
+    user_id = data.get('user_id')
+    sites = data.get('sites')
+    test_cc = data.get('test_cc', "4197475861867116|05|2034|500")
+    if not sites:
+        return jsonify({'error': 'No sites provided'}), 400
+    parts = test_cc.split('|')
+    if len(parts) != 4:
+        return jsonify({'error': 'Invalid test cc format'}), 400
+    test_cc_num, test_mm, test_yy, test_cvv = parts
+    valid_sites = []
+    invalid_sites = []
+    for site in sites:
+        site = normalize_site(site)
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            success, response, info = loop.run_until_complete(
+                checker.check_card(site, test_cc_num, test_mm, test_yy, test_cvv, None)
+            )
+            loop.close()
+            # Error indicators that mean site is problematic
+            error_indicators = [
+                "Error parsing", "Site Error", "Cannot access products",
+                "Connection error", "Not a Shopify site", "No products",
+                "Site not supported", "Timeout"
+            ]
+            is_error = any(ind in response for ind in error_indicators)
+            if not is_error:
+                valid_sites.append(site)
+            else:
+                invalid_sites.append({'site': site, 'reason': response[:100]})
+        except Exception as e:
+            invalid_sites.append({'site': site, 'reason': str(e)[:100]})
+    # Add valid sites to user's list
+    if user_id not in user_sites:
+        user_sites[user_id] = []
+    for site in valid_sites:
+        if site not in user_sites[user_id]:
+            user_sites[user_id].append(site)
+    return jsonify({'valid_sites': valid_sites, 'invalid_sites': invalid_sites})
+
+# ---------- User Site Management ----------
 @app.route('/user/<int:user_id>/sites', methods=['POST'])
 def add_user_site(user_id):
     site = request.args.get('site') or request.json.get('site')
