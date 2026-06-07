@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 checker = AutoShopifyChecker()
 
-MAX_CONCURRENT = 1
+MAX_CONCURRENT = 5
 MAX_RETRIES = 2
 RETRY_DELAY = 2
 
