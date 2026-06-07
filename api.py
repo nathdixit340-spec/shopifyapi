@@ -12,11 +12,12 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 checker = AutoShopifyChecker()
 
-MAX_CONCURRENT = 5
-MAX_RETRIES = 3
+# Stable concurrency for free tier
+MAX_CONCURRENT = 3
+MAX_RETRIES = 2
 RETRY_DELAY = 2
 
-mass_tasks = {}          # task_id -> {status, total, processed, results, stop_event, thread}
+mass_tasks = {}
 user_sites = {}
 user_proxies = {}
 
@@ -54,7 +55,7 @@ def single_check():
     proxy = data.get('proxy')
     parts = cc.split('|')
     if len(parts) != 4:
-        return jsonify({'error': 'Invalid format. Use cc|mm|yy|cvv'}), 400
+        return jsonify({'error': 'Invalid format'}), 400
     cc_num, mm, yy, cvv = parts
     success, response, info = run_async(checker.check_card(site, cc_num, mm, yy, cvv, proxy))
     return jsonify({
@@ -95,11 +96,10 @@ def mass_check():
             cc_parts = card_line.split('|')
             if len(cc_parts) != 4:
                 return {'card': card_line, 'error': 'Invalid format'}
-
             cc, mm, yy, cvv = cc_parts
             for attempt in range(MAX_RETRIES):
                 if stop_event.is_set():
-                    return {'card': card_line, 'error': 'Stopped by user'}
+                    return {'card': card_line, 'error': 'Stopped'}
                 site = sites[(site_idx + attempt) % len(sites)] if attempt > 0 else initial_site
                 try:
                     success, response, info = await checker.check_card(site, cc, mm, yy, cvv, proxy)
@@ -112,23 +112,19 @@ def mass_check():
                         'success': success,
                         'response': response,
                         'amount': info.get('amount'),
-                        'site': site,
-                        'attempts': attempt + 1
+                        'site': site
                     }
                 except Exception as e:
                     if attempt < MAX_RETRIES - 1:
                         await asyncio.sleep(RETRY_DELAY)
                         continue
-                    else:
-                        return {
-                            'card': card_line,
-                            'success': False,
-                            'response': f"Error: {str(e)}",
-                            'amount': None,
-                            'site': site,
-                            'attempts': attempt + 1
-                        }
-            return {'card': card_line, 'error': 'Max retries exceeded'}
+                    return {
+                        'card': card_line,
+                        'success': False,
+                        'response': f"Error: {str(e)}",
+                        'site': site
+                    }
+            return {'card': card_line, 'error': 'Max retries'}
 
         async def check_one(index, card_line):
             nonlocal site_idx, proxy_idx
@@ -137,9 +133,8 @@ def mass_check():
                     return
                 site = sites[site_idx % len(sites)]
                 site_idx += 1
-                proxy = None
+                proxy = proxies[proxy_idx % len(proxies)] if proxies else None
                 if proxies:
-                    proxy = proxies[proxy_idx % len(proxies)]
                     proxy_idx += 1
                 result = await check_with_retry(card_line, site, proxy)
                 if stop_event.is_set():
@@ -158,9 +153,7 @@ def mass_check():
         mass_tasks[task_id]['status'] = 'completed' if not stop_event.is_set() else 'stopped'
         loop.close()
 
-    thread = threading.Thread(target=run_concurrent_checks, daemon=True)
-    mass_tasks[task_id]['thread'] = thread
-    thread.start()
+    threading.Thread(target=run_concurrent_checks, daemon=True).start()
     return jsonify({'task_id': task_id})
 
 @app.route('/check/mass/<task_id>', methods=['GET'])
@@ -176,7 +169,7 @@ def stop_mass_check(task_id):
         return jsonify({'error': 'Task not found'}), 404
     task = mass_tasks[task_id]
     if task['status'] != 'running':
-        return jsonify({'error': 'Task already completed or stopped'}), 400
+        return jsonify({'error': 'Task already completed/stopped'}), 400
     stop_event = task.get('stop_event')
     if stop_event:
         stop_event.set()
@@ -188,7 +181,7 @@ def stop_mass_check(task_id):
         'results': task['results']
     })
 
-# ---------- Site Testing (Bulk Add) ----------
+# ---------- Site Testing (Concurrent, auto-adds valid) ----------
 @app.route('/user/<int:user_id>/sites/test', methods=['POST'])
 def test_and_add_sites():
     data = request.json
@@ -196,22 +189,16 @@ def test_and_add_sites():
     sites = data.get('sites')
     test_cc = data.get('test_cc', "4197475861867116|05|2034|500")
     if not sites:
-        return jsonify({'error': 'No sites provided'}), 400
+        return jsonify({'error': 'No sites'}), 400
     parts = test_cc.split('|')
     if len(parts) != 4:
-        return jsonify({'error': 'Invalid test cc format'}), 400
-    test_cc_num, test_mm, test_yy, test_cvv = parts
-    valid_sites = []
-    invalid_sites = []
-    for site in sites:
+        return jsonify({'error': 'Invalid test CC'}), 400
+    tc, tm, ty, tcvv = parts
+
+    async def test_one(site):
         site = normalize_site(site)
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            success, response, info = loop.run_until_complete(
-                checker.check_card(site, test_cc_num, test_mm, test_yy, test_cvv, None)
-            )
-            loop.close()
+            success, response, info = await checker.check_card(site, tc, tm, ty, tcvv, None)
             error_indicators = [
                 "Error parsing", "Site Error", "Cannot access products",
                 "Connection error", "Not a Shopify site", "No products",
@@ -219,17 +206,34 @@ def test_and_add_sites():
             ]
             is_error = any(ind in response for ind in error_indicators)
             if not is_error:
-                valid_sites.append(site)
+                return (site, True, response[:50])
             else:
-                invalid_sites.append({'site': site, 'reason': response[:100]})
+                return (site, False, response[:50])
         except Exception as e:
-            invalid_sites.append({'site': site, 'reason': str(e)[:100]})
-    if user_id not in user_sites:
-        user_sites[user_id] = []
-    for site in valid_sites:
-        if site not in user_sites[user_id]:
-            user_sites[user_id].append(site)
-    return jsonify({'valid_sites': valid_sites, 'invalid_sites': invalid_sites})
+            return (site, False, str(e)[:50])
+
+    async def test_all():
+        sem = asyncio.Semaphore(MAX_CONCURRENT)
+        async def limited_test(site):
+            async with sem:
+                return await test_one(site)
+        tasks = [limited_test(s) for s in sites]
+        results = await asyncio.gather(*tasks)
+        valid = [site for site, ok, _ in results if ok]
+        invalid = [{'site': site, 'reason': reason} for site, ok, reason in results if not ok]
+        # Auto-add valid sites
+        if user_id not in user_sites:
+            user_sites[user_id] = []
+        for site in valid:
+            if site not in user_sites[user_id]:
+                user_sites[user_id].append(site)
+        return valid, invalid
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    valid, invalid = loop.run_until_complete(test_all())
+    loop.close()
+    return jsonify({'valid_sites': valid, 'invalid_sites': invalid})
 
 # ---------- User Site Management ----------
 @app.route('/user/<int:user_id>/sites', methods=['POST'])
@@ -251,8 +255,8 @@ def get_user_sites(user_id):
 @app.route('/user/<int:user_id>/sites/<path:site>', methods=['DELETE'])
 def remove_user_site(user_id, site):
     site = normalize_site(site)
-    if user_id in user_sites:
-        user_sites[user_id] = [s for s in user_sites[user_id] if s != site]
+    if user_id in user_sites and site in user_sites[user_id]:
+        user_sites[user_id].remove(site)
     return jsonify({'status': 'ok'})
 
 @app.route('/user/<int:user_id>/sites/clear', methods=['DELETE'])
@@ -261,6 +265,7 @@ def clear_user_sites(user_id):
         user_sites[user_id] = []
     return jsonify({'status': 'ok'})
 
+# ---------- User Proxy Management ----------
 @app.route('/user/<int:user_id>/proxies', methods=['POST'])
 def add_user_proxy(user_id):
     proxy = request.args.get('proxy') or request.json.get('proxy')
