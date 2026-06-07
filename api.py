@@ -16,7 +16,7 @@ MAX_CONCURRENT = 5
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 
-mass_tasks = {}
+mass_tasks = {}          # task_id -> {status, total, processed, results, stop_event, thread}
 user_sites = {}
 user_proxies = {}
 
@@ -76,11 +76,13 @@ def mass_check():
         return jsonify({'error': 'Missing sites or cards'}), 400
 
     task_id = str(uuid.uuid4())
+    stop_event = threading.Event()
     mass_tasks[task_id] = {
         'status': 'running',
         'total': len(cards),
         'processed': 0,
-        'results': []
+        'results': [],
+        'stop_event': stop_event
     }
 
     def run_concurrent_checks():
@@ -96,6 +98,8 @@ def mass_check():
 
             cc, mm, yy, cvv = cc_parts
             for attempt in range(MAX_RETRIES):
+                if stop_event.is_set():
+                    return {'card': card_line, 'error': 'Stopped by user'}
                 site = sites[(site_idx + attempt) % len(sites)] if attempt > 0 else initial_site
                 try:
                     success, response, info = await checker.check_card(site, cc, mm, yy, cvv, proxy)
@@ -129,6 +133,8 @@ def mass_check():
         async def check_one(index, card_line):
             nonlocal site_idx, proxy_idx
             async with semaphore:
+                if stop_event.is_set():
+                    return
                 site = sites[site_idx % len(sites)]
                 site_idx += 1
                 proxy = None
@@ -136,6 +142,8 @@ def mass_check():
                     proxy = proxies[proxy_idx % len(proxies)]
                     proxy_idx += 1
                 result = await check_with_retry(card_line, site, proxy)
+                if stop_event.is_set():
+                    return
                 results[index] = result
                 mass_tasks[task_id]['processed'] += 1
                 mass_tasks[task_id]['results'] = [r for r in results if r is not None]
@@ -147,19 +155,40 @@ def mass_check():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(run_all())
-        mass_tasks[task_id]['status'] = 'completed'
+        mass_tasks[task_id]['status'] = 'completed' if not stop_event.is_set() else 'stopped'
         loop.close()
 
-    threading.Thread(target=run_concurrent_checks, daemon=True).start()
+    thread = threading.Thread(target=run_concurrent_checks, daemon=True)
+    mass_tasks[task_id]['thread'] = thread
+    thread.start()
     return jsonify({'task_id': task_id})
 
 @app.route('/check/mass/<task_id>', methods=['GET'])
 def get_mass_status(task_id):
     if task_id not in mass_tasks:
         return jsonify({'error': 'Task not found'}), 404
-    return jsonify(mass_tasks[task_id])
+    task = {k: v for k, v in mass_tasks[task_id].items() if k not in ['stop_event', 'thread']}
+    return jsonify(task)
 
-# ---------- Site Testing & Bulk Add ----------
+@app.route('/check/mass/<task_id>', methods=['DELETE'])
+def stop_mass_check(task_id):
+    if task_id not in mass_tasks:
+        return jsonify({'error': 'Task not found'}), 404
+    task = mass_tasks[task_id]
+    if task['status'] != 'running':
+        return jsonify({'error': 'Task already completed or stopped'}), 400
+    stop_event = task.get('stop_event')
+    if stop_event:
+        stop_event.set()
+    time.sleep(1)
+    return jsonify({
+        'status': 'stopped',
+        'total': task['total'],
+        'processed': task['processed'],
+        'results': task['results']
+    })
+
+# ---------- Site Testing (Bulk Add) ----------
 @app.route('/user/<int:user_id>/sites/test', methods=['POST'])
 def test_and_add_sites():
     data = request.json
@@ -183,7 +212,6 @@ def test_and_add_sites():
                 checker.check_card(site, test_cc_num, test_mm, test_yy, test_cvv, None)
             )
             loop.close()
-            # Error indicators that mean site is problematic
             error_indicators = [
                 "Error parsing", "Site Error", "Cannot access products",
                 "Connection error", "Not a Shopify site", "No products",
@@ -196,7 +224,6 @@ def test_and_add_sites():
                 invalid_sites.append({'site': site, 'reason': response[:100]})
         except Exception as e:
             invalid_sites.append({'site': site, 'reason': str(e)[:100]})
-    # Add valid sites to user's list
     if user_id not in user_sites:
         user_sites[user_id] = []
     for site in valid_sites:
