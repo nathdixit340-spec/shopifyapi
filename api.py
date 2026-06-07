@@ -3,6 +3,7 @@ import uuid
 import threading
 import time
 import logging
+import os
 from flask import Flask, request, jsonify
 from autoshopify import AutoShopifyChecker
 
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 checker = AutoShopifyChecker()
 
-MAX_CONCURRENT = 2
+MAX_CONCURRENT = 1          # Reduced to 1 for absolute stability
 MAX_RETRIES = 2
 RETRY_DELAY = 2
 
@@ -41,12 +42,18 @@ def normalize_site(site: str) -> str:
     return site.rstrip('/')
 
 def run_async(coro):
+    """Run an async coroutine in a fresh event loop (safe for Flask)."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(coro)
     finally:
         loop.close()
+
+# ---------- Health Check (for debugging) ----------
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok'})
 
 # ---------- Single Check ----------
 @app.route('/check/single', methods=['POST'])
@@ -57,7 +64,7 @@ def single_check():
     proxy = data.get('proxy')
     parts = cc.split('|')
     if len(parts) != 4:
-        return jsonify({'error': 'Invalid format'}), 400
+        return jsonify({'error': 'Invalid format. Use cc|mm|yy|cvv'}), 400
     cc_num, mm, yy, cvv = parts
     success, response, info = run_async(checker.check_card(site, cc_num, mm, yy, cvv, proxy))
     return jsonify({
@@ -105,7 +112,6 @@ def mass_check():
                 site = sites[(site_idx + attempt) % len(sites)] if attempt > 0 else initial_site
                 try:
                     success, response, info = await checker.check_card(site, cc, mm, yy, cvv, proxy)
-                    # Only retry on site errors (not on genuine declines)
                     is_site_error = any(err in response for err in SITE_ERROR_INDICATORS)
                     if is_site_error and attempt < MAX_RETRIES - 1:
                         await asyncio.sleep(RETRY_DELAY)
@@ -172,7 +178,7 @@ def stop_mass_check(task_id):
         return jsonify({'error': 'Task not found'}), 404
     task = mass_tasks[task_id]
     if task['status'] != 'running':
-        return jsonify({'error': 'Task already completed/stopped'}), 400
+        return jsonify({'error': 'Task already completed or stopped'}), 400
     stop_event = task.get('stop_event')
     if stop_event:
         stop_event.set()
@@ -184,60 +190,60 @@ def stop_mass_check(task_id):
         'results': task['results']
     })
 
-# ---------- Site Testing (batch, auto-adds valid) ----------
+# ---------- Site Testing (Sequential, Robust) ----------
 @app.route('/user/<int:user_id>/sites/test', methods=['POST'])
 def test_and_add_sites():
-    data = request.json
-    user_id = data.get('user_id')
-    sites = data.get('sites')
-    test_cc = data.get('test_cc', "4197475861867116|05|2034|500")
-    if not sites:
-        return jsonify({'error': 'No sites'}), 400
-    # Limit batch size to avoid memory/timeout
-    if len(sites) > 20:
-        return jsonify({'error': 'Too many sites (max 20 per request). Please split into multiple files.'}), 400
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No JSON data'}), 400
 
-    parts = test_cc.split('|')
-    if len(parts) != 4:
-        return jsonify({'error': 'Invalid test CC format'}), 400
-    tc, tm, ty, tcvv = parts
+        user_id = data.get('user_id')
+        sites = data.get('sites')
+        test_cc = data.get('test_cc', "4197475861867116|05|2034|500")
 
-    async def test_one(site):
-        site = normalize_site(site)
-        try:
-            success, response, info = await checker.check_card(site, tc, tm, ty, tcvv, None)
-            # Valid if no site error indicators
-            is_valid = not any(err in response for err in SITE_ERROR_INDICATORS)
-            return (site, is_valid, response[:100])
-        except Exception as e:
-            return (site, False, str(e)[:100])
+        if not sites or not isinstance(sites, list):
+            return jsonify({'error': 'No sites provided'}), 400
 
-    async def test_all():
-        sem = asyncio.Semaphore(MAX_CONCURRENT)
-        async def limited_test(site):
-            async with sem:
-                return await test_one(site)
-        tasks = [limited_test(s) for s in sites]
-        results = await asyncio.gather(*tasks)
-        valid = [site for site, ok, _ in results if ok]
-        invalid = [{'site': site, 'reason': reason} for site, ok, reason in results if not ok]
-        # Auto-add valid sites
+        if len(sites) > 10:
+            return jsonify({'error': 'Max 10 sites per request'}), 400
+
+        parts = test_cc.split('|')
+        if len(parts) != 4:
+            return jsonify({'error': 'Invalid test CC format. Use cc|mm|yy|cvv'}), 400
+        tc, tm, ty, tcvv = parts
+
+        valid = []
+        invalid = []
+
+        for site in sites:
+            site = normalize_site(site)
+            try:
+                # Run the card check in a fresh event loop
+                success, response, info = run_async(
+                    checker.check_card(site, tc, tm, ty, tcvv, None)
+                )
+                # Determine validity
+                is_valid = not any(err in response for err in SITE_ERROR_INDICATORS)
+                if is_valid:
+                    valid.append(site)
+                else:
+                    invalid.append({'site': site, 'reason': response[:100]})
+            except Exception as e:
+                invalid.append({'site': site, 'reason': str(e)[:100]})
+
+        # Auto-add valid sites to user's database
         if user_id not in user_sites:
             user_sites[user_id] = []
         for site in valid:
             if site not in user_sites[user_id]:
                 user_sites[user_id].append(site)
-        return valid, invalid
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        valid, invalid = loop.run_until_complete(test_all())
+        return jsonify({'valid_sites': valid, 'invalid_sites': invalid})
+
     except Exception as e:
-        loop.close()
-        return jsonify({'error': str(e)}), 500
-    loop.close()
-    return jsonify({'valid_sites': valid, 'invalid_sites': invalid})
+        logger.exception("Error in test_and_add_sites")
+        return jsonify({'error': f'Internal error: {str(e)}'}), 500
 
 # ---------- User Site Management ----------
 @app.route('/user/<int:user_id>/sites', methods=['POST'])
@@ -299,5 +305,7 @@ def clear_user_proxies(user_id):
         user_proxies[user_id] = []
     return jsonify({'status': 'ok'})
 
+# ---------- Run the App ----------
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000)
+    port = int(os.environ.get('PORT', 8000))
+    app.run(host='0.0.0.0', port=port)
