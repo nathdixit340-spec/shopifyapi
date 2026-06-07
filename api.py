@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 checker = AutoShopifyChecker()
 
-MAX_CONCURRENT = 1          # Reduced to 1 for absolute stability
+MAX_CONCURRENT = 1
 MAX_RETRIES = 2
 RETRY_DELAY = 2
 
@@ -21,7 +21,6 @@ mass_tasks = {}
 user_sites = {}
 user_proxies = {}
 
-# Error strings that indicate a site is NOT valid
 SITE_ERROR_INDICATORS = [
     "Site Error - Cannot access products",
     "Connection error",
@@ -42,7 +41,6 @@ def normalize_site(site: str) -> str:
     return site.rstrip('/')
 
 def run_async(coro):
-    """Run an async coroutine in a fresh event loop (safe for Flask)."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -50,12 +48,12 @@ def run_async(coro):
     finally:
         loop.close()
 
-# ---------- Health Check (for debugging) ----------
+# Health check
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
 
-# ---------- Single Check ----------
+# Single check
 @app.route('/check/single', methods=['POST'])
 def single_check():
     data = request.json
@@ -75,7 +73,7 @@ def single_check():
         'gateway': info.get('gateway')
     })
 
-# ---------- Mass Check ----------
+# Mass check (unchanged, works)
 @app.route('/check/mass', methods=['POST'])
 def mass_check():
     data = request.json
@@ -190,7 +188,10 @@ def stop_mass_check(task_id):
         'results': task['results']
     })
 
-# ---------- Site Testing (Sequential, Robust) ----------
+# ------------------------------------------------------------
+# FIXED /sites/test – completely synchronous, no concurrency,
+# uses the same run_async helper, and catches all errors.
+# ------------------------------------------------------------
 @app.route('/user/<int:user_id>/sites/test', methods=['POST'])
 def test_and_add_sites():
     try:
@@ -205,8 +206,9 @@ def test_and_add_sites():
         if not sites or not isinstance(sites, list):
             return jsonify({'error': 'No sites provided'}), 400
 
-        if len(sites) > 10:
-            return jsonify({'error': 'Max 10 sites per request'}), 400
+        # Limit to 5 sites at a time to avoid timeouts
+        if len(sites) > 5:
+            return jsonify({'error': 'Maximum 5 sites per request. Please split your file.'}), 400
 
         parts = test_cc.split('|')
         if len(parts) != 4:
@@ -219,11 +221,11 @@ def test_and_add_sites():
         for site in sites:
             site = normalize_site(site)
             try:
-                # Run the card check in a fresh event loop
+                # Use the same run_async helper that already works
                 success, response, info = run_async(
                     checker.check_card(site, tc, tm, ty, tcvv, None)
                 )
-                # Determine validity
+                # Valid if no site error indicators are present
                 is_valid = not any(err in response for err in SITE_ERROR_INDICATORS)
                 if is_valid:
                     valid.append(site)
@@ -232,7 +234,7 @@ def test_and_add_sites():
             except Exception as e:
                 invalid.append({'site': site, 'reason': str(e)[:100]})
 
-        # Auto-add valid sites to user's database
+        # Add valid sites to user's database
         if user_id not in user_sites:
             user_sites[user_id] = []
         for site in valid:
@@ -243,9 +245,11 @@ def test_and_add_sites():
 
     except Exception as e:
         logger.exception("Error in test_and_add_sites")
-        return jsonify({'error': f'Internal error: {str(e)}'}), 500
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
-# ---------- User Site Management ----------
+# ------------------------------------------------------------
+# User Site Management
+# ------------------------------------------------------------
 @app.route('/user/<int:user_id>/sites', methods=['POST'])
 def add_user_site(user_id):
     site = request.args.get('site') or request.json.get('site')
@@ -275,7 +279,6 @@ def clear_user_sites(user_id):
         user_sites[user_id] = []
     return jsonify({'status': 'ok'})
 
-# ---------- User Proxy Management ----------
 @app.route('/user/<int:user_id>/proxies', methods=['POST'])
 def add_user_proxy(user_id):
     proxy = request.args.get('proxy') or request.json.get('proxy')
@@ -305,7 +308,7 @@ def clear_user_proxies(user_id):
         user_proxies[user_id] = []
     return jsonify({'status': 'ok'})
 
-# ---------- Run the App ----------
+# ------------------------------------------------------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port)
