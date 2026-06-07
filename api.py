@@ -12,8 +12,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 checker = AutoShopifyChecker()
 
-# Stable concurrency for free tier
-MAX_CONCURRENT = 3
+MAX_CONCURRENT = 2
 MAX_RETRIES = 2
 RETRY_DELAY = 2
 
@@ -21,14 +20,17 @@ mass_tasks = {}
 user_sites = {}
 user_proxies = {}
 
-RETRYABLE_ERRORS = [
-    "Error parsing shipping response",
+# Error strings that indicate a site is NOT valid
+SITE_ERROR_INDICATORS = [
     "Site Error - Cannot access products",
+    "Connection error",
+    "Error parsing shipping response",
     "Error processing card",
-    "Site not supported",
-    "totalTaxAmount",
-    "429",
-    "CAPTCHA"
+    "Failed to get session token",
+    "Timeout",
+    "CAPTCHA",
+    "Not a Shopify site",
+    "No products found"
 ]
 
 def normalize_site(site: str) -> str:
@@ -103,10 +105,11 @@ def mass_check():
                 site = sites[(site_idx + attempt) % len(sites)] if attempt > 0 else initial_site
                 try:
                     success, response, info = await checker.check_card(site, cc, mm, yy, cvv, proxy)
-                    if any(err in response for err in RETRYABLE_ERRORS):
-                        if attempt < MAX_RETRIES - 1:
-                            await asyncio.sleep(RETRY_DELAY)
-                            continue
+                    # Only retry on site errors (not on genuine declines)
+                    is_site_error = any(err in response for err in SITE_ERROR_INDICATORS)
+                    if is_site_error and attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY)
+                        continue
                     return {
                         'card': card_line,
                         'success': success,
@@ -181,7 +184,7 @@ def stop_mass_check(task_id):
         'results': task['results']
     })
 
-# ---------- Site Testing (Concurrent, auto-adds valid) ----------
+# ---------- Site Testing (batch, auto-adds valid) ----------
 @app.route('/user/<int:user_id>/sites/test', methods=['POST'])
 def test_and_add_sites():
     data = request.json
@@ -190,27 +193,24 @@ def test_and_add_sites():
     test_cc = data.get('test_cc', "4197475861867116|05|2034|500")
     if not sites:
         return jsonify({'error': 'No sites'}), 400
+    # Limit batch size to avoid memory/timeout
+    if len(sites) > 20:
+        return jsonify({'error': 'Too many sites (max 20 per request). Please split into multiple files.'}), 400
+
     parts = test_cc.split('|')
     if len(parts) != 4:
-        return jsonify({'error': 'Invalid test CC'}), 400
+        return jsonify({'error': 'Invalid test CC format'}), 400
     tc, tm, ty, tcvv = parts
 
     async def test_one(site):
         site = normalize_site(site)
         try:
             success, response, info = await checker.check_card(site, tc, tm, ty, tcvv, None)
-            error_indicators = [
-                "Error parsing", "Site Error", "Cannot access products",
-                "Connection error", "Not a Shopify site", "No products",
-                "Site not supported", "Timeout"
-            ]
-            is_error = any(ind in response for ind in error_indicators)
-            if not is_error:
-                return (site, True, response[:50])
-            else:
-                return (site, False, response[:50])
+            # Valid if no site error indicators
+            is_valid = not any(err in response for err in SITE_ERROR_INDICATORS)
+            return (site, is_valid, response[:100])
         except Exception as e:
-            return (site, False, str(e)[:50])
+            return (site, False, str(e)[:100])
 
     async def test_all():
         sem = asyncio.Semaphore(MAX_CONCURRENT)
@@ -231,7 +231,11 @@ def test_and_add_sites():
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    valid, invalid = loop.run_until_complete(test_all())
+    try:
+        valid, invalid = loop.run_until_complete(test_all())
+    except Exception as e:
+        loop.close()
+        return jsonify({'error': str(e)}), 500
     loop.close()
     return jsonify({'valid_sites': valid, 'invalid_sites': invalid})
 
