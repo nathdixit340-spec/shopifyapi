@@ -1,3 +1,4 @@
+from database import init_db
 # ====================== CONFIGURATION (HARDCODED) ======================
 API_ID = 30919664
 API_HASH = "728958a80f9e4d36a499020e954adf15"
