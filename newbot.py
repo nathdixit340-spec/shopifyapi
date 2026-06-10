@@ -13,7 +13,7 @@ FORCE_JOIN_IMAGES = []
 
 # APIs
 SHOPIFY_API_URL = "https://haters.cxchk.site/shopii"
-RAZORPAY_API_URL = "https://web-production-9016f.up.railway.app/razorpay"
+RAZORPAY_API_URL = "https://razorpayapi-production.up.railway.app/razorpay"
 
 # Worker limits
 SP_PER_USER_WORKERS = 30
