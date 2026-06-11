@@ -2,3 +2,5 @@ telethon
 aiohttp
 aiofiles
 psutil
+pydantic
+requests
