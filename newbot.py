@@ -12,7 +12,7 @@ JOIN_CHANNEL_LINK = "https://t.me/RavenCheckerV2"
 FORCE_JOIN_IMAGES = []
 
 # APIs – UPDATE THIS WITH YOUR RAILWAY API URL
-SHOPIFY_API_URL = "https://your-app.up.railway.app/shopify"   # <-- CHANGE ME
+SHOPIFY_API_URL = "https://shopapi-production-f0cc.up.railway.app"   # <-- CHANGE ME
 RAZORPAY_API_URL = "https://razorpayapi-production.up.railway.app/razorpay"
 
 # Worker limits
